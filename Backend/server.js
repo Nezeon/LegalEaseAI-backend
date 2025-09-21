@@ -1,5 +1,4 @@
 const express = require('express');
-const mongoose = require('mongoose');
 const dotenv = require('dotenv');
 const cors = require('cors');
 
@@ -8,15 +7,6 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 app.use(cors());
-
-// Connect to MongoDB (optional)
-if (process.env.MONGO_URI) {
-  mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log('MongoDB connected successfully'))
-    .catch(err => console.error('MongoDB connection error:', err));
-} else {
-  console.warn('MONGO_URI not set. Skipping MongoDB connection.');
-}
 
 // Test route
 app.get('/', (req, res) => {

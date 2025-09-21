@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const admin = require("../firebaseAdmin");
+const { MongoClient, ObjectId } = require("mongodb");
 const upload = require("../middleware/upload");
 const { spawn } = require("child_process");
 const path = require("path");
@@ -10,6 +11,32 @@ const COLLECTION = "documents";
 
 // Check if Firebase is available
 const db = admin.apps.length > 0 ? admin.firestore() : null;
+
+// MongoDB connection
+const mongoClient = new MongoClient(process.env.MONGO_URI);
+let mongoDB = null;
+let mongoConnected = false;
+
+// Initialize MongoDB connection
+async function initializeMongoDB() {
+  if (mongoConnected) return mongoDB;
+
+  try {
+    if (process.env.MONGO_URI) {
+      await mongoClient.connect();
+      mongoDB = mongoClient.db(); // Uses database from MONGO_URI
+      mongoConnected = true;
+      console.log('✅ Connected to MongoDB');
+      return mongoDB;
+    } else {
+      console.warn('⚠️ MONGO_URI not set. MongoDB features will be disabled.');
+      return null;
+    }
+  } catch (err) {
+    console.error('❌ MongoDB connection error:', err.message);
+    return null;
+  }
+}
 
 function sanitizeFileMeta(file) {
   return {
@@ -31,31 +58,37 @@ router.post("/upload", upload.single("file"), async (req, res) => {
     }
 
     const docData = sanitizeFileMeta(req.file);
-    
+
+    // Initialize MongoDB connection if needed
+    const mongoDB = await initializeMongoDB();
+
+    // Store in both databases
+    let firebaseId = null;
+    let mongoId = null;
+
     if (db) {
-      // Use Firebase if available
+      // Firebase storage
       const docRef = await db.collection(COLLECTION).add(docData);
-      return res.status(201).json({ success: true, id: docRef.id, data: docData });
-    } else {
-      // Fallback to local storage
-      const id = `local-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-      const localData = { id, ...docData };
-      
-      // Save to local metadata file
-      const metadataFile = path.join(__dirname, "..", "uploads", "metadata.json");
-      let metadata = [];
-      if (fs.existsSync(metadataFile)) {
-        try {
-          metadata = JSON.parse(fs.readFileSync(metadataFile, 'utf8'));
-        } catch (e) {
-          metadata = [];
-        }
-      }
-      metadata.push(localData);
-      fs.writeFileSync(metadataFile, JSON.stringify(metadata, null, 2));
-      
-      return res.status(201).json({ success: true, id, data: localData });
+      firebaseId = docRef.id;
     }
+
+    if (mongoDB) {
+      // MongoDB storage
+      const result = await mongoDB.collection(COLLECTION).insertOne({
+        ...docData,
+        firebaseId: firebaseId || null
+      });
+      mongoId = result.insertedId;
+    }
+
+    return res.status(201).json({
+      success: true,
+      ids: {
+        firebase: firebaseId,
+        mongo: mongoId?.toString()
+      },
+      data: docData
+    });
   } catch (err) {
     console.error("Error uploading doc:", err);
     return res.status(500).json({ success: false, message: "Failed to upload document" });
@@ -72,6 +105,9 @@ router.post("/simplify", async (req, res) => {
     if (!inputFilePath && !text) {
       return res.status(400).json({ success: false, message: "Provide filePath or text" });
     }
+
+    // Initialize MongoDB connection if needed
+    const mongoDB = await initializeMongoDB();
 
     // If raw text is provided, write it to a temporary file so the Python script can read it
     let tempFilePath = inputFilePath;
@@ -111,18 +147,64 @@ router.post("/simplify", async (req, res) => {
       console.error("Failed to start Python process:", err);
     });
 
-    child.on("close", (code) => {
-      console.log("Python script finished with code:", code);
-      console.log("Python stdout:", stdout);
-      console.log("Python stderr:", stderr);
-      
-      if (isTemp && tempFilePath && fs.existsSync(tempFilePath)) {
-        try { fs.unlinkSync(tempFilePath); } catch (_) {}
+    child.on("close", async (code) => {
+      try {
+        console.log("Python script finished with code:", code);
+        console.log("Python stdout:", stdout);
+        console.log("Python stderr:", stderr);
+
+        if (isTemp && tempFilePath && fs.existsSync(tempFilePath)) {
+          try { fs.unlinkSync(tempFilePath); } catch (_) {}
+        }
+
+        if (code === 0) {
+          // Update both databases with processing results
+          const updateData = {
+            status: "processed",
+            processedAt: new Date().toISOString(),
+            simplifiedText: stdout
+          };
+
+          // Extract IDs from request body if they exist
+          const { firebaseId, mongoId } = req.body;
+
+          // Update Firebase if available and ID provided
+          if (db && firebaseId) {
+            await db.collection(COLLECTION)
+              .doc(firebaseId)
+              .update(updateData);
+          }
+
+          // Update MongoDB if available and ID provided
+          if (mongoDB && mongoId) {
+            await mongoDB.collection(COLLECTION)
+              .updateOne(
+                { _id: new ObjectId(mongoId) },
+                { $set: updateData }
+              );
+          }
+        }
+
+        if (code !== 0) {
+          return res.status(500).json({
+            success: false,
+            message: "Simplification failed",
+            error: stderr || stdout
+          });
+        }
+
+        return res.status(200).json({
+          success: true,
+          output: stdout
+        });
+      } catch (error) {
+        console.error("Database update error:", error);
+        return res.status(500).json({
+          success: false,
+          message: "Failed to update document status",
+          error: error.message
+        });
       }
-      if (code !== 0) {
-        return res.status(500).json({ success: false, message: "Simplification failed", error: stderr || stdout });
-      }
-      return res.status(200).json({ success: true, output: stdout });
     });
 
     // Send the file path to the Python script via stdin for its input() prompt
